@@ -1,0 +1,2 @@
+export CUDA_VISIBLE_DEVICES=5
+python3 batch_generate_steps_data.py

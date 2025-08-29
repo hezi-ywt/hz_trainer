@@ -1,0 +1,57 @@
+# DMD训练配置文件 - 内存优化版本
+
+model:
+  model_name: "NextDiT_2B_GQA_patch2_Adaln_Refiner"
+  model_path: "/mnt/huggingface/Lumina-Image-2.0"
+  vae_path: "/mnt/huggingface/Neta-Lumina/VAE/ae.safetensors"
+  text_encoder_path: "/mnt/huggingface/Neta-Lumina/Text Encoder/gemma_2_2b_fp16.safetensors"
+  init_from: "/mnt/huggingface/Neta-Lumina/Unet/neta-lumina-v1.0.safetensors"
+  use_ema: false
+  use_fake_model: false
+  use_real_model: false
+
+advanced:
+  use_ema: false
+  vae_encode_batch_size: 1
+
+data:
+  train_data_dir: "/mnt/hz_trainer/batch_output_20250827_112221"
+  val_data_dir: "/mnt/hz_trainer/batch_output_20250827_002903"
+  max_train_samples: 50  # 减少训练样本数量
+  max_val_samples: 10    # 减少验证样本数量
+
+trainer:
+  batch_size: 1
+  learning_rate: 1e-5
+  weight_decay: 0.01
+  max_epochs: 5          # 减少训练轮数
+  num_workers: 2         # 减少worker数量
+  grad_clip: 1.0
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 8  # 增加梯度累积步数
+  gradient_clip_val: 1.0
+  # 内存优化设置
+  enable_checkpointing: true   # 启用梯度检查点
+  enable_progress_bar: true
+  log_every_n_steps: 5
+  val_check_interval: 0.5
+
+generation:
+  image_height: 1024
+  image_width: 1024
+  steps: 30
+  guidance_scale: 5.0
+  cfg_trunc_ratio: 1.0
+  seed: null
+  discrete_flow_shift: 6.0
+  renorm_cfg: 1.0
+
+k_diffusion:
+  use_k_diffusion: true
+  sampler: "euler_ancestral_RF"
+  scheduler_func: "linear_quadratic_schedule"
+
+output:
+  output_dir: "./output" 
