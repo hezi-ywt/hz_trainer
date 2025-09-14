@@ -14,6 +14,5 @@ mkdir -p output
 # 运行训练
 python train_dmd_test.py \
     --config configs/dmd_train_config.yaml \
-    --seed 42
 
 echo "训练完成!" 

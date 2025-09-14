@@ -5,13 +5,10 @@ model:
   model_path: "/mnt/huggingface/Lumina-Image-2.0"
   vae_path: "/mnt/huggingface/Neta-Lumina/VAE/ae.safetensors"
   text_encoder_path: "/mnt/huggingface/Neta-Lumina/Text Encoder/gemma_2_2b_fp16.safetensors"
-  # init_from: "/mnt/huggingface/Neta-Lumina/Unet/neta-lumina-v1.0.safetensors"
-  init_from: "/mnt/hz_trainer/lu2_lightning_test/dmd_model_epoch=66_step=153363_val_loss=0.0000.safetensors"
+  init_from: "/mnt/huggingface/Neta-Lumina/Unet/neta-lumina-v1.0.safetensors"
   use_ema: false
   use_fake_model: false
-  use_real_model: true
-  use_text_encoder: false
-  use_lora: false
+  use_real_model: True
 
 advanced:
   use_ema: false
@@ -22,33 +19,18 @@ data:
   val_data_dir: "/mnt/hz_trainer/batch_output_20250827_002903"
   max_train_samples: null  # 测试时限制样本数量
   max_val_samples: null
-  
 
 trainer:
   batch_size: 1
-  learning_rate: 1e-4
+  learning_rate: 5e-5
   weight_decay: 0.01
   max_epochs: 100
-  num_workers: 2  # 减少worker数量以节省内存
-  grad_clip: 0
-  checkpoint_dir: "./checkpoints7"
+  num_workers: 4  # 增加worker数量以提高数据加载性能
+  grad_clip: 1.0
+  checkpoint_dir: "./checkpoints"
   log_dir: "./logs"
   precision: "bf16-mixed"
-  strategy: "deepspeed"
-  accumulate_grad_batches: 1
-  checkpoint_frequency: 1
-  save_every_n_epochs: 1
-  save_every_n_steps: 500
-  seed: 42
-  save_format: "safetensors"
-  gradient_checkpointing: true
-  lora_config:
-    multiplier: 1
-    linear_dim: 128
-    linear_alpha: 0
-    algo: "lora"
-    kwargs: {}
-    target_modules: [".*attn.*", ".*mlp.*", ".*linear.*"]
+  accumulate_grad_batches: 4
 
 generation:
   image_height: 1024

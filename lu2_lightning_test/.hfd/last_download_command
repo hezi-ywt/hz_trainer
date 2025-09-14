@@ -1,0 +1,1 @@
+REPO_ID=heziiiii/lu2_lightning_test TOOL=aria2c INCLUDE_PATTERNS=dmd_model_epoch=66_step=153363_val_loss=0.0000.safetensors EXCLUDE_PATTERNS= DATASET=0 HF_USERNAME= HF_TOKEN= HF_TOKEN=https://hf-mirror.com REVISION=main

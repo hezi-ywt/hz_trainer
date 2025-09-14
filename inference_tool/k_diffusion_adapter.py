@@ -113,7 +113,7 @@ class KDiffusionModelWrapper(torch.nn.Module):
         )
 
         #print(f"[DEBUG] v_pred_cond stats: mean={v_pred_cond.mean().item():.6f}, std={v_pred_cond.std().item():.6f}")
-
+        print(f"[DEBUG] current_timestep: {current_timestep[0].item():.6f}")
         if current_timestep[0] < self.cfg_trunc_ratio:
             # self.inner_model.prepare_block_swap_before_forward()
             v_pred_uncond = self.inner_model(
@@ -131,7 +131,7 @@ class KDiffusionModelWrapper(torch.nn.Module):
                         v_pred[i] = v_pred[i] * (max_new_norm / noise_norm)
         else:
             v_pred = v_pred_cond
-        
+            v_pred_uncond = torch.zeros_like(v_pred_cond)
         # 根据原始main.py中的negative sign
         # noise_pred = -noise_pred, 然后 denoised = sample - model_output * sigma
         # 等效于：denoised = sample - (-v_pred) * sigma = sample + v_pred * sigma

@@ -33,6 +33,7 @@ logs/
 
 # Checkpoints and outputs
 checkpoints/
+checkpoints*/
 output/
 batch_output/
 batch_output_*/

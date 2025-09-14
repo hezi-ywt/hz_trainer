@@ -22,7 +22,15 @@ flip_norm = T.Compose(
                 
             ]
         )
+
+def get_close_item(num,item_list):
+    '''
+    获取最接近num的item和ids
+    '''
+    return min(item_list, key=lambda x: abs(x - num)), item_list.index(min(item_list, key=lambda x: abs(x - num)))
  
+
+
 
 class DMDStepsDataset(Dataset):
     """
@@ -320,7 +328,7 @@ class DMDDataLoader:
             num_workers=num_workers,
             **kwargs
         )
-           
+
     @staticmethod
     def custom_collate_fn(batch):
         """
@@ -336,13 +344,18 @@ class DMDDataLoader:
         cap_masks = []
         v_preds = []
         t1 = []
+        
+        
+        
         # v_pred_conds = []
         # v_pred_unconds = []
-        # neg_feats = []
-        # neg_masks = []
+        neg_feats = []
+        neg_masks = []
         # guidance_scales = []
         # shifts = []
         step_sample_num = 1
+        max_sigmas = 1
+        min_sigmas = 0
         for item in batch:
             if 'image' in item:
                 images.append(item['image'])
@@ -358,7 +371,14 @@ class DMDDataLoader:
                 # _v_preds = []
 
                 # print(item['steps_data'])
+                
+                # if random.random() < 0.5:
+                
+
                 ids = random.sample(range(len(item['steps_data'])), step_sample_num)
+                # else:
+                #     ids = [get_close_item(random.random(), item['steps_data'])[1] for num in ids]
+
                 for id in ids:
                     step = item['steps_data'][id]
                     sigmas.append(step['data']['sigma'])
@@ -369,6 +389,9 @@ class DMDDataLoader:
                     cap_feats.append(step['data']['cap_feats'])
                     cap_masks.append(step['data']['cap_mask'])
                     v_preds.append(step['data']['v_pred'])
+                    neg_feats.append(step['data']['neg_feats'])
+                    neg_masks.append(step['data']['neg_mask'])
+                    
 
 
                 # stack - 保持tensor在CPU上，让模型自己移动到GPU
@@ -408,6 +431,18 @@ class DMDDataLoader:
                     else:
                         cap_masks = torch.tensor(np.array(cap_masks))
                     cap_masks = cap_masks.squeeze(1)
+                if neg_feats:
+                    if isinstance(neg_feats[0], torch.Tensor):
+                        neg_feats = torch.cat(neg_feats)
+                    else:
+                        neg_feats = torch.tensor(np.array(neg_feats))
+                    neg_feats = neg_feats.squeeze(1)
+                if neg_masks:
+                    if isinstance(neg_masks[0], torch.Tensor):
+                        neg_masks = torch.cat(neg_masks)
+                    else:
+                        neg_masks = torch.tensor(np.array(neg_masks))
+                    neg_masks = neg_masks.squeeze(1)
                 if v_preds:
                     if isinstance(v_preds[0], torch.Tensor):
                         v_preds = torch.cat(v_preds)
@@ -451,6 +486,8 @@ class DMDDataLoader:
             'cap_masks': cap_masks.to(torch.int32),
             'v_preds': v_preds,
             't1': t1,
+            'neg_feats': neg_feats,
+            'neg_masks': neg_masks,
             # 'prompt_embeds': cap_feats,  # 为了兼容模型输入
             # 'prompt_masks': cap_masks,   # 为了兼容模型输入
         }
@@ -558,66 +595,69 @@ def visualize_steps_data(steps_data: List[Dict[str, Any]], save_path: Optional[s
 
 # 使用示例
 if __name__ == "__main__":
-    # 示例1: 加载steps数据集
-    data_dir = "/mnt/hz_trainer/batch_output_20250827_112221"  # 替换为实际路径
+    # # 示例1: 加载steps数据集
+    # data_dir = "/mnt/hz_trainer/batch_output_20250827_112221"  # 替换为实际路径
     
-    try:
-        # 创建数据集
-        dataset = DMDStepsDataset(
-            data_dir=data_dir,
-            load_images=True,
-            load_steps_data=True,
-            max_samples=None # 只加载前10个样本用于测试
-        )
+    # try:
+    #     # 创建数据集
+    #     dataset = DMDStepsDataset(
+    #         data_dir=data_dir,
+    #         load_images=True,
+    #         load_steps_data=True,
+    #         max_samples=None # 只加载前10个样本用于测试
+    #     )
         
-        # 打印统计信息
-        print("提示词统计:")
-        prompt_stats = dataset.get_prompt_statistics()
-        for key, value in prompt_stats.items():
-            print(f"  {key}: {value}")
+    #     # 打印统计信息
+    #     print("提示词统计:")
+    #     prompt_stats = dataset.get_prompt_statistics()
+    #     for key, value in prompt_stats.items():
+    #         print(f"  {key}: {value}")
         
-        print("\nSteps数据统计:")
-        steps_stats = dataset.get_steps_statistics()
-        for key, value in steps_stats.items():
-            print(f"  {key}: {value}")
+    #     print("\nSteps数据统计:")
+    #     steps_stats = dataset.get_steps_statistics()
+    #     for key, value in steps_stats.items():
+    #         print(f"  {key}: {value}")
         
-        # 加载第一个样本
-        if len(dataset) > 0:
-            sample = dataset[0]
-            print(f"\n第一个样本:")
-            print(f"  文件名: {sample['filename']}")
-            print(f"  提示词: {sample['metadata']['prompt'][:100]}...")
-            print(f"  图像尺寸: {sample['image'].size if 'image' in sample else 'N/A'}")
-            print(f"  Steps数量: {len(sample['steps_data']) if 'steps_data' in sample else 'N/A'}")
+    #     # 加载第一个样本
+    #     if len(dataset) > 0:
+    #         sample = dataset[0]
+    #         print(f"\n第一个样本:")
+    #         print(f"  文件名: {sample['filename']}")
+    #         print(f"  提示词: {sample['metadata']['prompt'][:100]}...")
+    #         print(f"  图像尺寸: {sample['image'].size if 'image' in sample else 'N/A'}")
+    #         print(f"  Steps数量: {len(sample['steps_data']) if 'steps_data' in sample else 'N/A'}")
             
-            # 可视化steps数据
-            if 'steps_data' in sample:
-                visualize_steps_data(sample['steps_data'])
+    #         # 可视化steps数据
+    #         if 'steps_data' in sample:
+    #             visualize_steps_data(sample['steps_data'])
         
-    except Exception as e:
-        print(f"加载数据集时出错: {e}")
+    # except Exception as e:
+    #     print(f"加载数据集时出错: {e}")
     
-    # 示例2: 使用DataLoader
-    dataloader = DMDDataLoader.create_steps_dataloader(
-        data_dir=data_dir,
-        batch_size=1,
-        shuffle=False,
-        max_samples=4
-    )
+    # # 示例2: 使用DataLoader
+    # dataloader = DMDDataLoader.create_steps_dataloader(
+    #     data_dir=data_dir,
+    #     batch_size=1,
+    #     shuffle=False,
+    #     max_samples=4
+    # )
     
-    print(f"\nDataLoader测试:")
-    for batch_idx, batch in enumerate(dataloader):
-        print(f"  批次 {batch_idx}: {len(batch['sigmas'])} 个样本")
-        # print(batch['steps_data'][0].keys())
-        if batch_idx >= 1:  # 只显示前2个批次
-            print(batch['sigmas'])
-            print(batch['current_timestep'])
-            print(batch['t1'])
-            # print(batch['x1'])
-            print(batch['denoised'].shape)
-            # print(batch['cap_feats'])
-            # print(batch['cap_masks'])
-            # print(batch['v_preds'])
-            break
+    # print(f"\nDataLoader测试:")
+    # for batch_idx, batch in enumerate(dataloader):
+    #     print(f"  批次 {batch_idx}: {len(batch['sigmas'])} 个样本")
+    #     # print(batch['steps_data'][0].keys())
+    #     if batch_idx >= 1:  # 只显示前2个批次
+    #         print(batch['sigmas'])
+    #         print(batch['current_timestep'])
+    #         print(batch['t1'])
+    #         # print(batch['x1'])
+    #         print(batch['denoised'].shape)
+    #         # print(batch['cap_feats'])
+    #         # print(batch['cap_masks'])
+    #         # print(batch['v_preds'])
+    #         break
 
-                
+    li = [1,2,3,4,5,6,7,8,9,10]
+    num = 7.2
+    item, id = get_close_item(num, li)
+    print(item, id)

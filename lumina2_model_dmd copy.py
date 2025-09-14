@@ -13,19 +13,12 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch.utils.checkpoint as checkpoint
+import torch.utils.checkpoint
 import lightning as pl
 from copy import deepcopy
 import shutil
 import numpy as np
 import math
-import deepspeed
-
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointImpl,
-    apply_activation_checkpointing,
-    checkpoint_wrapper,
-)
 
 # from modules.scheduler_utils import apply_zero_terminal_snr, cache_snr_values
 # from common.utils import get_class, load_torch_file, EmptyInitWrapper, get_world_size
@@ -38,7 +31,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from models.lumina import models
-from models.LyCORIS.lycoris import create_lycoris, LycorisNetwork
 from models.lumina.transport import create_transport, Sampler
 from lightning.pytorch.utilities import rank_zero_only
 from safetensors.torch import save_file
@@ -92,55 +84,52 @@ class Lumina2ModelDMD(pl.LightningModule):
         trainer_cfg = self.config.trainer
         config = self.config
         advanced = config.get("advanced", {})
-        if "deepspeed" in self.config.trainer.get("strategy", "auto"):
-            import deepspeed
-        if self.config.model.get("use_text_encoder", True):
-            # tokenizer
-            if self.config.model.get("tokenizer_path", None):
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    self.config.model.tokenizer_path,
-                    use_fast=False,
-                    local_files_only=True
-                )
-            else:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_path,
-                    subfolder="tokenizer",
-                    use_fast=False,
-                    local_files_only=True
-                )
-            self.tokenizer.padding_side = "right"
+        
+        #tokenizer
+        if self.config.model.get("tokenizer_path", None):
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model.tokenizer_path,
+                use_fast=False,
+                local_files_only=True
+            )
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                subfolder="tokenizer",
+                use_fast=False,
+                local_files_only=True
+            )
+        self.tokenizer.padding_side = "right"
 
-            #text_encoder   
-            if self.config.model.get("text_encoder_path", None):
-                if self.config.model.text_encoder_path.endswith(".safetensors"):
-                    # 如果是 .safetensors 文件，使用 load_gemma2 函数
-                    from models.lumina.models.extra_model import load_gemma2
-                    self.text_encoder = load_gemma2(
-                        ckpt_path=self.config.model.text_encoder_path,
-                        dtype=torch.bfloat16,
-                        device=self.target_device
-                    )
-                else:
-                    # 如果是模型目录，使用 AutoModel.from_pretrained
-                    self.text_encoder = AutoModel.from_pretrained(
-                        self.config.model.text_encoder_path,
-                        local_files_only=True,
-                        torch_dtype=torch.bfloat16
-                    ).cuda()
+        #text_encoder   
+        if self.config.model.get("text_encoder_path", None):
+            if self.config.model.text_encoder_path.endswith(".safetensors"):
+                # 如果是 .safetensors 文件，使用 load_gemma2 函数
+                from models.lumina.models.extra_model import load_gemma2
+                self.text_encoder = load_gemma2(
+                    ckpt_path=self.config.model.text_encoder_path,
+                    dtype=torch.bfloat16,
+                    device=self.target_device
+                )
             else:
+                # 如果是模型目录，使用 AutoModel.from_pretrained
                 self.text_encoder = AutoModel.from_pretrained(
-                    self.model_path,
-                    subfolder="text_encoder",
+                    self.config.model.text_encoder_path,
                     local_files_only=True,
                     torch_dtype=torch.bfloat16
                 ).cuda()
+        else:
+            self.text_encoder = AutoModel.from_pretrained(
+                self.model_path,
+                subfolder="text_encoder",
+                local_files_only=True,
+                torch_dtype=torch.bfloat16
+            ).cuda()
 
-            self.text_encoder.to("cpu")
-            logger.info(f"text encoder: {type(self.text_encoder)}")
-            print(f"text encoder: {self.text_encoder.config.hidden_size}")
-            self.cap_feat_dim = self.text_encoder.config.hidden_size
-        self.cap_feat_dim = 2304
+
+        logger.info(f"text encoder: {type(self.text_encoder)}")
+        self.cap_feat_dim = self.text_encoder.config.hidden_size
+         
 
         # Create model:
         self.model = models.__dict__[self.config.model.model_name](
@@ -299,7 +288,7 @@ class Lumina2ModelDMD(pl.LightningModule):
             )
 
        
-        self.vae.to("cpu")
+
 
 
         if advanced.get("latents_mean", None):
@@ -310,109 +299,21 @@ class Lumina2ModelDMD(pl.LightningModule):
         
         self.vae.to(self.target_device)
         self.vae.requires_grad_(False)
-        # 使用更内存友好的方式创建模型副本
+        self.model.to(self.target_device)
+        self.model.train()
+        self.model.requires_grad_(True)
         if self.config.model.get("use_real_model", False):
-            if self.config.model.get("real_model_path", None):
-                self.real_model = models.__dict__[self.config.model.model_name](
-                    in_channels=16,
-                    qk_norm=self.config.model.get("qk_norm", True),
-                    cap_feat_dim=self.cap_feat_dim,
-                ).to(dtype=torch.bfloat16)
-                    
-                logger.info(f"Initializing real teacher model weights from: {self.config.model.real_model_path}")
-                if self.config.model.real_model_path.endswith(".pth") or self.config.model.real_model_path.endswith(".pt") or self.config.model.real_model_path.endswith(".safetensors") or self.config.model.real_model_path.endswith(".ckpt"):
-                    from common.model_loader import load_model_weights
-                    state_dict = load_model_weights(self.config.model.real_model_path, device=self.target_device)
-                else:
-                    state_dict = torch.load(
-                        os.path.join(
-                            self.config.model.real_model_path,
-                            f"consolidated.{0:02d}-of-{1:02d}.pth",
-                        ),
-                        map_location="cpu",
-                    )
-
-                size_mismatch_keys = []
-                model_state_dict = self.model.state_dict()
-                for k, v in state_dict.items():
-                    if k in model_state_dict and model_state_dict[k].shape != v.shape:
-                        size_mismatch_keys.append(k)
-                for k in size_mismatch_keys:
-                    del state_dict[k]
-                del model_state_dict
-
-                missing_keys, unexpected_keys = self.real_model.load_state_dict(state_dict, strict=False)
-                del state_dict
-                logger.info("Real Teacher Model initialization result:")
-                logger.info(f"  Size mismatch keys: {size_mismatch_keys}")
-                logger.info(f"  Teacher Model Missing keys: {missing_keys}")
-                logger.info(f"  Teacher Model Unexpeected keys: {unexpected_keys}")
-            else:
-                self.model.to("cpu")
-                self.real_model = deepcopy(self.model)
-                self.real_model.requires_grad_(False)
-                self.real_model.to(self.target_device)
-                self.model.to(self.target_device)
-            self.real_model.eval()
+            self.real_model = deepcopy(self.model)
+            self.real_model.requires_grad_(False)
         if self.config.model.get("use_fake_model", False):
-            # 先移动到CPU进行复制，再移回GPU
-            self.model.to("cpu")
             self.fake_model = deepcopy(self.model)
             self.fake_model.requires_grad_(True)
-            self.fake_model.to(self.target_device)
-            self.model.to(self.target_device)
-        if self.config.model.get("use_text_encoder", True):
-            self.text_encoder.requires_grad_(False)
+        self.text_encoder.requires_grad_(False)
         self.vae.requires_grad_(False)
 
-        self.vae.to("cpu")
-        # self.text_encoder.to("cpu")
-        self.model.to(self.target_device)
-        if self.config.model.get("use_lora", False):
-            LycorisNetwork.apply_preset({"target_name": self.config.model.get("lora_config", {}).get("target_modules", [".*attn.*", ".*mlp.*", ".*linear.*"])})
-            self.lycoris_net = create_lycoris(self.model, 
-            multiplier=self.config.model.get("lora_config", {}).get("multiplier", 1),
-            linear_dim=self.config.model.get("lora_config", {}).get("linear_dim", 128),
-            linear_alpha=self.config.model.get("lora_config", {}).get("linear_alpha", 0),
-            algo=self.config.model.get("lora_config", {}).get("algo", "lora"),
-            kwargs=self.config.model.get("lora_config", {}).get("kwargs", {}),
-            )
-            self.lycoris_net.apply_to()
-            self.lycoris_net.requires_grad_(True)
-            self.lycoris_net.to(self.target_device)
-            # self.lycoris_net.train()
-            self.model.requires_grad_(False)
-        else:
-            self.model.requires_grad_(True)
-            self.model.train()
-        
-        if self.config.trainer.get("gradient_checkpointing", False):
-            if self.config.model.get("use_lora", False) and hasattr(self.lycoris_net, "gradient_checkpointing_enable"):
-                self.lycoris_net.gradient_checkpointing_enable()
-
-            elif hasattr(self.model, "gradient_checkpointing_enable"):
-                self.model.gradient_checkpointing_enable()
-            
-            gradient_checkpointing_list = list(self.model.get_checkpointing_wrap_module_list())
-            non_reentrant_wrapper = partial(
-                    checkpoint_wrapper,
-                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-                )
-            apply_activation_checkpointing(
-                    self.model,
-                    checkpoint_wrapper_fn=non_reentrant_wrapper,
-                    check_fn=lambda submodule: submodule in gradient_checkpointing_list,
-                )
-            # apply_activation_checkpointing(
-            #     model_ema,
-            #     checkpoint_wrapper_fn=non_reentrant_wrapper,
-            #     check_fn=lambda submodule: submodule in checkpointing_list_ema,
-            # )
-
-        # if hasattr(self.model, "compile"):
-        #     self.model = torch.compile(self.model)
         # self.tokenizer.to(self.target_device)
         # self.tokenizer.requires_grad_(False)
+
 
     @torch.no_grad()
     def encode_prompt(self, prompt_batch, text_encoder, tokenizer, proportion_empty_prompts, is_train=True):
@@ -485,11 +386,16 @@ class Lumina2ModelDMD(pl.LightningModule):
         return x
         
         
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # 更新EMA模型
         if hasattr(self, "model_ema"):
             self.update_ema()
     
+
+
+
+
     
     @torch.no_grad()
     def update_ema(self, decay=0.95):
@@ -579,81 +485,60 @@ class Lumina2ModelDMD(pl.LightningModule):
         else:
             return alpha_t * x1 + sigma_t * x0
 
-    def forward(self, batch):
-        if self.config.trainer.get("gradient_checkpointing", False):
-            if "deepspeed" in self.config.trainer.get("strategy", "auto"):
-                return deepspeed.checkpointing.checkpoint(self._forward, batch)
-            else:
-                return checkpoint.checkpoint(self._forward, batch, use_reentrant=False)
-        else:
-            return self._forward(batch)
-            
 
-    def _forward(self, batch):
+
+    def forward(self, batch):
         # 获取batch数据并移动到正确的设备
         prompt_embeds = batch["cap_feats"].to(self.model.x_embedder.weight.dtype)
         prompt_masks = batch["cap_masks"].to(torch.int32)
         sigmas = batch["sigmas"]
-        latents = batch["denoised"].to(self.model.x_embedder.weight.dtype)  # 使用denoised作为当前噪声图像
-        x1 = batch["x1"].to(self.model.x_embedder.weight.dtype)  # 目标图像
+        latents = batch["denoised"]  # 使用denoised作为当前噪声图像
+        x1 = batch["x1"]  # 目标图像
         batch_size = x1.shape[0]
 
+        # image = self.vae.decode(x1)
+        # image = (image / 2 + 0.5).clamp(0, 1)
+        # image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        # image = (image * 255).round().astype("uint8")
+        # pil_image = Image.fromarray(image[0])
+        # pil_image.save(f"test_denoised{time.time()}.png")
+        # image = batch["image"]
+        # image = image.to(self.target_device)
+        # image = image.to(self.model.x_embedder.weight.dtype)
+        # image = image.to(self.model.x_embedder.weight.dtype)
+        # latents = self.vae.encode(image)
+        # latents = latents.to(self.target_device)
+        # latents = latents.to(self.model.x_embedder.weight.dtype)
+        # image = self.vae.decode(latents)
+        # image = (image / 2 + 0.5).clamp(0, 1)
+        # image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        # image = (image * 255).round().astype("uint8")
+        # pil_image = Image.fromarray(image[0])
+        # pil_image.save(f"test_latents_raw{time.time()}.png")
+        # time.sleep(5)
         xt = latents
         ut = (x1 - xt) / sigmas.view(-1, 1, 1, 1)
         t = 1 - sigmas
         
         # 前向传播
         v_pred = self.model(xt, t, cap_feats=prompt_embeds, cap_mask=prompt_masks)
-        neg_feats = batch["neg_feats"].to(self.model.x_embedder.weight.dtype)
-        neg_masks = batch["neg_masks"].to(torch.int32)
-        v_real_pred = self.real_model(xt, t, cap_feats=prompt_embeds, cap_mask=prompt_masks)
-        v_real_negtive_pred = self.real_model(xt, t, cap_feats=neg_feats, cap_mask=neg_masks)
-        v_real_pred_cfg = v_real_negtive_pred + 3 * (v_real_pred - v_real_negtive_pred)
         # x1_pred = xt + v_pred * sigmas.view(-1, 1, 1, 1)
         # 计算损失
         terms = {}
         terms["task_loss"] = torch.mean(((v_pred - ut) ** 2), dim=list(range(1, len(x1.size()))))
-        terms["task_loss_cfg_distill"] = torch.mean(((v_real_pred_cfg - v_pred) ** 2), dim=list(range(1, len(x1.size()))))
-        # terms["task_loss_cfg_distill"] = 0.0
+        terms["loss"] = terms["task_loss"]
+        terms["task_loss"] = terms["task_loss"].clone().detach()
         terms["t"] = t
         
-
-
-        noise = torch.randn_like(x1).to(self.model.x_embedder.weight.dtype)
-
-        t2 = torch.rand((batch_size,)).to(self.target_device).to(self.model.x_embedder.weight.dtype)
-
-        latent2 = t2 * x1 + (1.0 - t2) * noise 
-        vpred2 = self.model(latent2, t2, cap_feats=prompt_embeds, cap_mask=prompt_masks)
-        ut2 =  x1 - noise
-        terms["task_loss_2"] = torch.mean(((vpred2 - ut2) ** 2), dim=list(range(1, len(x1.size()))))
-
-        v_real_pred2 = self.real_model(latent2, t2, cap_feats=prompt_embeds, cap_mask=prompt_masks)
-        v_real_negtive_pred2 = self.real_model(latent2, t2, cap_feats=neg_feats, cap_mask=neg_masks)
-        v_real_pred2_cfg = v_real_negtive_pred2 + 3 * (v_real_pred2 - v_real_negtive_pred2)
-        terms["task_loss_2_distill"] = torch.mean(((v_real_pred2_cfg - vpred2) ** 2), dim=list(range(1, len(x1.size()))))
-        
-        # self.log("loss", loss, prog_bar=True,on_step=True,on_epoch=True,logger=True)
-        # self.log("task_loss", terms["task_loss"], prog_bar=True,on_step=True,on_epoch=True,logger=True)
-        # self.log("task_loss_cfg_distill", terms["task_loss_cfg_distill"], prog_bar=True,on_step=True,on_epoch=True,logger=True)
-        # self.log("t", t, prog_bar=True,on_step=True,on_epoch=True,logger=True)
-        # 返回损失和额外的信息，让调用者处理日志记录
-        terms["loss"] = terms["task_loss"] + terms["task_loss_cfg_distill"] + terms["task_loss_2"] + terms["task_loss_2_distill"]
-
-        # terms["task_loss"] = terms["task_loss"].clone().detach() 
-        # terms["task_loss_cfg_distill"] = terms["task_loss_cfg_distill"].clone().detach()
-        # terms["task_loss_2"] = terms["task_loss_2"].clone().detach()
-        # terms["task_loss_2_distill"] = terms["task_loss_2_distill"].clone().detach()
         loss = terms["loss"]
-        # return {
-        #     "loss": loss,
-        #     "task_loss": terms["task_loss"],
-        #     "task_loss_cfg_distill": terms["task_loss_cfg_distill"] if terms["task_loss_cfg_distill"] is not None else 0.0, 
-        #     "task_loss_2": terms["task_loss_2"] if terms["task_loss_2"] is not None else 0.0, 
-        #     "task_loss_2_distill": terms["task_loss_2_distill"] if terms["task_loss_2_distill"] is not None else 0.0,
-        #     "t": t if t is not None else 0.0
-        # }
-        return loss
+        
+        # 返回损失和额外的信息，让调用者处理日志记录
+        return {
+            "loss": loss,
+            "task_loss": terms["task_loss"],
+            "t": t
+        }
+
     @torch.inference_mode()
     def generate_image(
         self,
@@ -818,7 +703,7 @@ if __name__ == "__main__":
             "text_encoder_path": "/mnt/huggingface/Neta-Lumina/Text Encoder/gemma_2_2b_fp16.safetensors",
             # "tokenizer_path": "/mnt/huggingface/Neta-Lumina-diffusers/tokenizer",
             # "init_from": "/mnt/huggingface/Neta-Lumina/Unet/neta-lumina-v1.0.safetensors",
-            "init_from": "/mnt/hz_trainer/checkpoints7/checkpoint-epoch_2_step_6500.safetensors",
+            "init_from": "/mnt/hz_trainer/checkpoints/dmd_model_epoch=97_step=224322_val_loss=0.0000.safetensors",
             "use_ema": False,
             "use_fake_model": False,
             "use_real_model": False,
@@ -831,11 +716,11 @@ if __name__ == "__main__":
             "grad_clip": 1.0
         },
         "generation": {
-            "image_height": 1216,
-            "image_width": 896,
+            "image_height": 1024,
+            "image_width": 1024,
             "steps": 15,
             "guidance_scale": 3.0,
-            "cfg_trunc_ratio": 0.0,
+            "cfg_trunc_ratio": 1.0,
             "seed": 114514,
             "discrete_flow_shift": 6.0,
             "renorm_cfg": 1.0
@@ -886,13 +771,8 @@ if __name__ == "__main__":
         # return kwargs
 
     model.generate_image(model.model,
-        # prompt="you are an assistant designed to generate anime images based on textual prompts. <Prompt Start> 1girl",
         # prompt="you are an assistant designed to generate anime images based on textual prompts. <Prompt Start> The artwork, by terigumi, presents a POV shot of Jane Doe from Zenless Zone Zero, kneeling and looking down at the viewer with a flirty smile. Jane has short, silver-gray hair, large aqua eyes and pink animal ears, as well as a black tail with a gold-colored tip. She wears a revealing black outfit that exposes her cleavage, paired with black pantyhose. Her arms extend towards the viewer, as if to embrace them.",
-        # prompt="You are an assistant designed to generate anime images based on textual prompts. <Prompt Start> freng style, Neta, girl, young woman, leaning on hand, smoking, cigarette, black hair, long hair, buns, purple and pink intake hair, purple eyes, shirt, blazer, red tie, black pantyhose, high heels, black heels, seated, on desk, office chair, looking up, thoughtful, smoke",
-        # prompt = "You are an assistant designed to generate anime images based on textual prompts. <Prompt Start> This artwork by Yoneyama Mai depicts Neta, a young female character with luminous violet eyes and signature twin high buns featuring flowing pink and purple strands. She performs an energetic dance while holding traditional handheld sparklers (fireworks) in both hands, creating dazzling golden-orange trails of light as she twirls. The sparklers emit cascading embers that illuminate her delicate facial features and vibrant hair, with some glowing particles blending into her colorful strands like liquid stardust. Her ornate outfit combines futuristic metallic elements with traditional frills, shimmering with reflective highlights as she moves. The scene takes place in a twilight setting with deep indigo shadows, making the warm sparkler glow stand out dramatically. Dynamic motion effects include blurred arm movements, glowing particle trails, and floating cherry blossom petals caught in the heat waves. Yoneyama Mai's signature ethereal lighting enhances the magical atmosphere, with color contrasts between cool purples and warm golden-orange hues creating visual vibrancy.",
-        # prompt = "You are an assistant designed to generate anime images based on textual prompts. <Prompt Start> Neta has purple eyes. Her hair is styled in two high buns, with streaks of pink and purple. This illustration, created by agoto, showcases Neta in a dynamic pose, wielding a large weapon against a stark white background. Neta wearing a military-inspired outfit. The outfit is predominantly green, with darker green accents and strategic cutouts revealing a glimpse of the character's underwear. The character's attire includes a peaked cap, goggles, and a complex contraption strapped to their back with several yellow glowing lights, resembling a fuel tank or power source. A circular object with a transparent part like a monocle hangs down from the character's hat. The character is holding a massive, futuristic gun, with multiple barrels and a complex mechanism, emitting a sickly green smoke. The weapon is pointed downwards. The character's stance is angled, as if caught in a moment of intense action. The overall style is a detailed, anime-influenced aesthetic, with strong line work and meticulous shading, emphasizing the textures of the clothing and weapon. The weapon appears to have a toxic or energy-based element to it.",
-        # prompt = "You are an assistant designed to generate anime images based on textual prompts. <Prompt Start> This artwork by Yoneyama Mai depicts a captivating underwater scene featuring a young female character named Neta. The composition showcases Neta gracefully diving or floating in a serene aquatic environment, viewed from a dynamic low-angle perspective that emphasizes her movement. Neta is portrayed with striking purple eyes that convey a sense of wonder and tranquility. Her hair is styled in two high buns, adorned with vibrant streaks of pink and purple that blend seamlessly into the surrounding water, creating a mesmerizing, fluid effect. The interplay of light and shadow enhances the ethereal quality of her hair as it disperses like ink in the currents. The underwater setting is rich with luminous blues and greens, with sunlight filtering through the water to cast shimmering reflections. Bubbles and gentle ripples surround Neta, enhancing the illusion of depth and motion. The artist's use of color and lighting creates a dreamlike atmosphere, balancing realism with a touch of surreal beauty. Neta's expression is serene yet full of life, capturing a moment of quiet exploration. The overall composition is both dynamic and harmonious, evoking a sense of weightlessness and freedom. The artwork masterfully combines delicate details with bold contrasts, making it visually striking and emotionally evocative.",
-        prompt = "You are an assistant designed to generate anime images based on textual prompts. <Prompt Start> 1girl, wlop, solo, long hair, breasts, skirt, black hair, long sleeves, closed mouth, cleavage, medium breasts, jacket, weapon, outdoors, pleated skirt, open clothes, open jacket, sleeves past wrists, lips, gun, plaid, plaid skirt, looking down, tank top, red jacket, motor vehicle, unworn headwear, railing, red lips, motorcycle, leaning, leaning on object, against railing, sensitive,",
+        prompt="You are an assistant designed to generate anime images based on textual prompts. <Prompt Start> freng style, Neta, girl, young woman, leaning on hand, smoking, cigarette, black hair, long hair, buns, purple and pink intake hair, purple eyes, shirt, blazer, red tie, black pantyhose, high heels, black heels, seated, on desk, office chair, looking up, thoughtful, smoke",
         negative_prompt="You are an assistant designed to generate anime images based on textual prompts. <Prompt Start> blurry, worst quality, low quality, jpeg artifacts, signature, watermark, username, error, deformed hands, bad anatomy, extra limbs, poorly drawn hands, poorly drawn face, mutation, deformed, extra eyes, extra arms, extra legs, malformed limbs, fused fingers, too many fingers, long neck, cross‑eyed, bad proportions, missing arms, missing legs, extra digit, fewer digits, cropped, normal quality",
         config=config,
         hook_fn=get_sample_hook

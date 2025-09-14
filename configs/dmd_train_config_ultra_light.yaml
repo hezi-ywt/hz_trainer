@@ -1,4 +1,4 @@
-# 内存优化的DMD训练配置文件
+# 超轻量级DMD训练配置文件 - 最大化节约显存
 
 model:
   model_name: "NextDiT_2B_GQA_patch2_Adaln_Refiner"
@@ -8,7 +8,7 @@ model:
   init_from: "/mnt/huggingface/Neta-Lumina/Unet/neta-lumina-v1.0.safetensors"
   use_ema: false
   use_fake_model: false
-  use_real_model: true  # 只使用real_model，减少内存占用
+  use_real_model: true  # 只使用real_model
 
 advanced:
   use_ema: false
@@ -17,32 +17,32 @@ advanced:
 data:
   train_data_dir: "/mnt/hz_trainer/batch_output"
   val_data_dir: "/mnt/hz_trainer/batch_output_20250827_002903"
-  max_train_samples: 100  # 限制训练样本数量以节省内存
-  max_val_samples: 50
+  max_train_samples: 50  # 极少量样本用于测试
+  max_val_samples: 10
 
 trainer:
   batch_size: 1
-  learning_rate: 5e-5
+  learning_rate: 1e-4
   weight_decay: 0.01
-  max_epochs: 10  # 减少epoch数量
-  num_workers: 1  # 最小worker数量
+  max_epochs: 5  # 极少量epoch
+  num_workers: 0  # 不使用多进程
   grad_clip: 1.0
   checkpoint_dir: "./checkpoints"
   log_dir: "./logs"
-  precision: "bf16-mixed"  # 使用混合精度
-  accumulate_grad_batches: 8  # 增加梯度累积以减少内存峰值
-  # 内存优化设置
+  precision: "bf16-mixed"  # 混合精度
+  accumulate_grad_batches: 16  # 大量梯度累积
+  # 显存优化设置
   strategy: "ddp_find_unused_parameters_false"
   sync_batchnorm: false
-  enable_progress_bar: false  # 禁用进度条以节省内存
+  enable_progress_bar: false
   enable_checkpointing: true
   enable_logging: true
-  log_every_n_steps: 10  # 减少日志频率
+  log_every_n_steps: 20  # 极少日志
 
 generation:
-  image_height: 512  # 减少图像尺寸以节省内存
-  image_width: 512
-  steps: 20  # 减少推理步数
+  image_height: 256  # 极小图像尺寸
+  image_width: 256
+  steps: 10  # 极少推理步数
   guidance_scale: 5.0
   cfg_trunc_ratio: 1.0
   seed: null
@@ -55,4 +55,7 @@ k_diffusion:
   scheduler_func: "linear_quadratic_schedule"
 
 output:
-  output_dir: "./output" 
+  output_dir: "./output"
+
+
+

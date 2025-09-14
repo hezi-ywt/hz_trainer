@@ -56,49 +56,39 @@ class DMDTrainer(Lumina2ModelDMD):
     
     def training_step(self, batch, batch_idx):
         result = self.forward(batch)
-         # 处理不同的返回值格式
-        if isinstance(result, dict):
-            loss = result["loss"]
-        elif isinstance(result, tuple):
-            loss = result[0]  # 第一个元素是 loss
-        else:
-            loss = result  # 直接是 tensor
-        
+        loss = result["loss"]
+       
+        metrics ={
+            'train_loss': loss,
+            'task_loss': result["task_loss"],
+            'task_loss_cfg_distill': result["task_loss_cfg_distill"],
+            't': result["t"]
+        }
+        self.fabric.log_dict(metrics, step=self.global_step)
+        # 添加梯度裁剪
+        if hasattr(self.config.trainer, 'grad_clip') and self.config.trainer.grad_clip > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.parameters(), 
+                max_norm=self.config.trainer.grad_clip
+            )
+            self.fabric.log("grad_norm", grad_norm, prog_bar=True)
+
         return loss
     
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
             result = self.forward(batch)
         loss = result["loss"]
-        # self.log('val_loss', loss, prog_bar=True)
-        # self.log('val_task_loss', result["task_loss"], prog_bar=False)
-        # self.log('val_task_loss_cfg_distill', result["task_loss_cfg_distill"], prog_bar=False)
-        # self.log('val_task_loss_2', result["task_loss_2"], prog_bar=False)
-        # self.log('val_task_loss_2_distill', result["task_loss_2_distill"], prog_bar=False)
-        # self.log('val_t', result["t"], prog_bar=False)
+        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_task_loss', result["task_loss"], prog_bar=False)
         return loss
     
     def configure_optimizers(self):
-        if self.config.model.get("use_lora", False):
-            lycoris_net_params = self.lycoris_net.prepare_optimizer_params(lr=self.learning_rate)
-            optimizer = optim.AdamW(
-                lycoris_net_params,
-                lr=self.learning_rate,
-                weight_decay=self.weight_decay
-            ) 
-        else:
-            optimizer = optim.AdamW(
-                self.model.parameters(),
-                lr=self.learning_rate,
-                weight_decay=self.weight_decay
-            )
-
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in self.parameters())
-        print(f"可训练参数: {trainable_params:,}")
-        print(f"总参数: {total_params:,}")
-        print(f"可训练比例: {trainable_params/total_params:.2%}")
-
+        optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )        
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=self.config.trainer.max_epochs
@@ -163,6 +153,7 @@ def main():
         seed=config.trainer.get("seed", None),
     )
 
+    print(config.trainer.get("save_every_n_steps", None))
     # Instantiate objects
     model = DMDTrainer(config)
     

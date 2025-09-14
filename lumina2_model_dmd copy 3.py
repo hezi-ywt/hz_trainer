@@ -13,19 +13,12 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch.utils.checkpoint as checkpoint
+import torch.utils.checkpoint
 import lightning as pl
 from copy import deepcopy
 import shutil
 import numpy as np
 import math
-import deepspeed
-
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointImpl,
-    apply_activation_checkpointing,
-    checkpoint_wrapper,
-)
 
 # from modules.scheduler_utils import apply_zero_terminal_snr, cache_snr_values
 # from common.utils import get_class, load_torch_file, EmptyInitWrapper, get_world_size
@@ -38,7 +31,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from models.lumina import models
-from models.LyCORIS.lycoris import create_lycoris, LycorisNetwork
 from models.lumina.transport import create_transport, Sampler
 from lightning.pytorch.utilities import rank_zero_only
 from safetensors.torch import save_file
@@ -92,8 +84,7 @@ class Lumina2ModelDMD(pl.LightningModule):
         trainer_cfg = self.config.trainer
         config = self.config
         advanced = config.get("advanced", {})
-        if "deepspeed" in self.config.trainer.get("strategy", "auto"):
-            import deepspeed
+        
         if self.config.model.get("use_text_encoder", True):
             # tokenizer
             if self.config.model.get("tokenizer_path", None):
@@ -368,47 +359,10 @@ class Lumina2ModelDMD(pl.LightningModule):
         self.vae.to("cpu")
         # self.text_encoder.to("cpu")
         self.model.to(self.target_device)
-        if self.config.model.get("use_lora", False):
-            LycorisNetwork.apply_preset({"target_name": self.config.model.get("lora_config", {}).get("target_modules", [".*attn.*", ".*mlp.*", ".*linear.*"])})
-            self.lycoris_net = create_lycoris(self.model, 
-            multiplier=self.config.model.get("lora_config", {}).get("multiplier", 1),
-            linear_dim=self.config.model.get("lora_config", {}).get("linear_dim", 128),
-            linear_alpha=self.config.model.get("lora_config", {}).get("linear_alpha", 0),
-            algo=self.config.model.get("lora_config", {}).get("algo", "lora"),
-            kwargs=self.config.model.get("lora_config", {}).get("kwargs", {}),
-            )
-            self.lycoris_net.apply_to()
-            self.lycoris_net.requires_grad_(True)
-            self.lycoris_net.to(self.target_device)
-            # self.lycoris_net.train()
-            self.model.requires_grad_(False)
-        else:
-            self.model.requires_grad_(True)
-            self.model.train()
-        
-        if self.config.trainer.get("gradient_checkpointing", False):
-            if self.config.model.get("use_lora", False) and hasattr(self.lycoris_net, "gradient_checkpointing_enable"):
-                self.lycoris_net.gradient_checkpointing_enable()
-
-            elif hasattr(self.model, "gradient_checkpointing_enable"):
-                self.model.gradient_checkpointing_enable()
-            
-            gradient_checkpointing_list = list(self.model.get_checkpointing_wrap_module_list())
-            non_reentrant_wrapper = partial(
-                    checkpoint_wrapper,
-                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-                )
-            apply_activation_checkpointing(
-                    self.model,
-                    checkpoint_wrapper_fn=non_reentrant_wrapper,
-                    check_fn=lambda submodule: submodule in gradient_checkpointing_list,
-                )
-            # apply_activation_checkpointing(
-            #     model_ema,
-            #     checkpoint_wrapper_fn=non_reentrant_wrapper,
-            #     check_fn=lambda submodule: submodule in checkpointing_list_ema,
-            # )
-
+        self.model.train()
+        self.model.requires_grad_(True)
+        if hasattr(self.model, "gradient_checkpointing_enable") and self.config.trainer.get("gradient_checkpointing", False):
+            self.model.gradient_checkpointing_enable()
         # if hasattr(self.model, "compile"):
         #     self.model = torch.compile(self.model)
         # self.tokenizer.to(self.target_device)
@@ -579,17 +533,8 @@ class Lumina2ModelDMD(pl.LightningModule):
         else:
             return alpha_t * x1 + sigma_t * x0
 
-    def forward(self, batch):
-        if self.config.trainer.get("gradient_checkpointing", False):
-            if "deepspeed" in self.config.trainer.get("strategy", "auto"):
-                return deepspeed.checkpointing.checkpoint(self._forward, batch)
-            else:
-                return checkpoint.checkpoint(self._forward, batch, use_reentrant=False)
-        else:
-            return self._forward(batch)
-            
 
-    def _forward(self, batch):
+    def forward(self, batch):
         # 获取batch数据并移动到正确的设备
         prompt_embeds = batch["cap_feats"].to(self.model.x_embedder.weight.dtype)
         prompt_masks = batch["cap_masks"].to(torch.int32)
@@ -640,20 +585,19 @@ class Lumina2ModelDMD(pl.LightningModule):
         # 返回损失和额外的信息，让调用者处理日志记录
         terms["loss"] = terms["task_loss"] + terms["task_loss_cfg_distill"] + terms["task_loss_2"] + terms["task_loss_2_distill"]
 
-        # terms["task_loss"] = terms["task_loss"].clone().detach() 
-        # terms["task_loss_cfg_distill"] = terms["task_loss_cfg_distill"].clone().detach()
-        # terms["task_loss_2"] = terms["task_loss_2"].clone().detach()
-        # terms["task_loss_2_distill"] = terms["task_loss_2_distill"].clone().detach()
+        terms["task_loss"] = terms["task_loss"].clone().detach() 
+        terms["task_loss_cfg_distill"] = terms["task_loss_cfg_distill"].clone().detach()
+        terms["task_loss_2"] = terms["task_loss_2"].clone().detach()
+        terms["task_loss_2_distill"] = terms["task_loss_2_distill"].clone().detach()
         loss = terms["loss"]
-        # return {
-        #     "loss": loss,
-        #     "task_loss": terms["task_loss"],
-        #     "task_loss_cfg_distill": terms["task_loss_cfg_distill"] if terms["task_loss_cfg_distill"] is not None else 0.0, 
-        #     "task_loss_2": terms["task_loss_2"] if terms["task_loss_2"] is not None else 0.0, 
-        #     "task_loss_2_distill": terms["task_loss_2_distill"] if terms["task_loss_2_distill"] is not None else 0.0,
-        #     "t": t if t is not None else 0.0
-        # }
-        return loss
+        return {
+            "loss": loss,
+            "task_loss": terms["task_loss"],
+            "task_loss_cfg_distill": terms["task_loss_cfg_distill"] if terms["task_loss_cfg_distill"] is not None else 0.0, 
+            "task_loss_2": terms["task_loss_2"] if terms["task_loss_2"] is not None else 0.0, 
+            "task_loss_2_distill": terms["task_loss_2_distill"] if terms["task_loss_2_distill"] is not None else 0.0,
+            "t": t if t is not None else 0.0
+        }
     @torch.inference_mode()
     def generate_image(
         self,
